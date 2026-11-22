@@ -26,7 +26,7 @@ def default_data_dir() -> Path:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data-dir", type=Path, default=default_data_dir())
-    ap.add_argument("--models", nargs="*", default=["base.en"],
+    ap.add_argument("--models", nargs="*", default=["base.en", "small.en"],  # both are used by local:cascade
                     help="Whisper models to download now (tiny.en base.en small.en medium.en large-v3-turbo)")
     a = ap.parse_args()
     env_dir = a.data_dir / "engine"

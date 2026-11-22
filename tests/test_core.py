@@ -211,6 +211,56 @@ class MeetingFlowTests(Base):
         self.assertTrue(res["notes"])
 
 
+class ModelChoiceTests(Base):
+    def test_default_is_local_cascade_with_bedrock_fallback(self):
+        self.assertEqual(self.settings["stt_model"], "local:cascade")
+        self.assertFalse(core.engine_available(self.data))
+        self.assertEqual(core.effective_stt_model(self.settings, self.data), core.BEDROCK_STT_FALLBACK)
+        self.fake.transcripts = ["hello there"]
+        text, _ = core.transcribe_wav(self.settings, silent_wav(), data_dir=self.data)
+        self.assertEqual(text, "hello there")
+        self.assertEqual(self.fake.calls[-1][1]["modelId"], core.BEDROCK_STT_FALLBACK)
+
+    def test_recommend_cheapest_within_one_point(self):
+        rows = [{"model": "a", "ok": True, "wer": 0.050, "usd_per_hour": 0.02, "seconds_per_audio_minute": 2},
+                {"model": "b", "ok": True, "wer": 0.058, "usd_per_hour": 0.0, "seconds_per_audio_minute": 4},
+                {"model": "c", "ok": True, "wer": 0.090, "usd_per_hour": 0.0, "seconds_per_audio_minute": 1},
+                {"model": "d", "ok": False, "error": "x"}]
+        self.assertEqual(core.recommend_stt(rows), "b")
+        self.assertIsNone(core.recommend_stt([rows[3]]))
+
+    def test_comparison_respects_a_user_choice(self):
+        report = {"results": [{"model": "local:base.en", "ok": True, "wer": 0.05, "usd_per_hour": 0.0}]}
+        core.save_stt_eval(self.data, report)
+        self.assertEqual(core.load_settings(self.data)["stt_model"], "local:base.en")
+        core.save_settings(self.data, {"stt_model": "mistral.voxtral-mini-3b-2507"})
+        self.assertTrue(core.load_settings(self.data)["stt_model_from_user"])
+        core.save_stt_eval(self.data, report)
+        self.assertEqual(core.load_settings(self.data)["stt_model"], "mistral.voxtral-mini-3b-2507")
+
+
+class SpeakerTests(Base):
+    def test_merge_turns_joins_and_folds(self):
+        # a's two close turns join; b's 0.3 s blip is too short to transcribe and folds into a.
+        turns = core.merge_turns([[0.0, 2.0, "a"], [2.3, 4.0, "a"], [4.1, 4.4, "b"], [6.0, 8.0, "a"]])
+        self.assertEqual([(t["start"], t["end"], t["speaker"]) for t in turns],
+                         [(0.0, 4.4, "a"), (6.0, 8.0, "a")])
+
+    def test_skipped_without_engine_and_rename(self):
+        m = core.create_meeting(self.data, "t")
+        meta = core.label_speakers(self.data, self.settings, m["id"])
+        self.assertIn("not installed", meta["speakers_status"])
+        d = core.meeting_dir(self.data, m["id"])
+        (d / "turns.jsonl").write_text(json.dumps({"start_ms": 0, "end_ms": 900, "speaker": "Speaker 1",
+                                                   "text": "hi"}) + "\n", "utf-8")
+        with self.assertRaises(core.AppError):
+            core.update_meeting(self.data, m["id"], {"speaker_names": {"Speaker 9": "Bob"}})
+        core.update_meeting(self.data, m["id"], {"speaker_names": {"Speaker 1": "Ana"}})
+        got = core.get_meeting(self.data, m["id"])
+        self.assertEqual(got["turns"][0]["speaker"], "Ana")
+        self.assertEqual(core.speaker_rows(self.data, m["id"])[0]["text"], "Ana: hi")
+
+
 class ConnectionTests(Base):
     def test_check_connection_reports_each_model(self):
         out = core.check_connection(self.settings)

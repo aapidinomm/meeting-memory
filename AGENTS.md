@@ -43,6 +43,12 @@ write the same `data/settings.json`.
 | `scripts/uninstall.sh` | Keeps `data/` unless `PURGE_DATA=1` |
 | `skills/meeting-memory/SKILL.md` | What the chat agent loads to use the MCP tools |
 | `tests/test_core.py` | unittest suite with a fake Bedrock client |
+| `engine/` | Local engine run as a subprocess in `data/engine` (a venv from `scripts/setup_engine.py`): `diarize.py` (who spoke when), `cascade.py` (the default `local:cascade` speech-to-text: base.en, then small.en where unsure), `worker.py` (JSON on stdin/stdout). Both algorithms are the best verified versions from KiroCrew Scientist searches |
+| `eval/diarization/`, `eval/stt/` | Synthetic labeled meetings (`make_meetings.py`, macOS voices), the Scientist scorers, and `eval/stt/compare.py`, which scores every speech-to-text model on quality, cost and speed and writes `data/stt_eval.json` |
+
+The default `stt_model` is `local:cascade`. Without the engine, transcription falls back to Bedrock Voxtral
+(`BEDROCK_STT_FALLBACK`), and speaker labels are skipped with a note on the meeting. A comparison run switches
+the model to its recommendation only while `stt_model_from_user` is false.
 
 ## Rules for changes
 

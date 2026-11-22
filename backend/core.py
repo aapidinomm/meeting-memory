@@ -38,7 +38,9 @@ SCHEMA_VERSION = 1
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "aws_profile": "",
     "aws_region": "us-west-2",
-    "stt_model": "mistral.voxtral-small-24b-2507",
+    # Best verified setup from the model-selection search (eval/stt). Falls back to BEDROCK_STT_FALLBACK when
+    # the local engine is not installed.
+    "stt_model": "local:cascade",
     "llm_model": "us.anthropic.claude-sonnet-4-6",
     "embed_model": "amazon.titan-embed-text-v2:0",
     "embed_dims": 512,
@@ -57,7 +59,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 # Speech-to-text models the app can use. Bedrock prices are USD per 1M tokens, on-demand, US East/West
 # (https://aws.amazon.com/bedrock/pricing/, read 2026-11-22). Local models run on this machine through the
 # engine (faster-whisper, int8 on CPU) and cost no money; the first use downloads them.
+BEDROCK_STT_FALLBACK = "mistral.voxtral-small-24b-2507"
 STT_MODELS: List[Dict[str, Any]] = [
+    {"id": "local:cascade", "label": "Whisper base.en + small.en where unsure (local, recommended)",
+     "kind": "local", "size_mb": 630},
     {"id": "mistral.voxtral-small-24b-2507", "label": "Voxtral Small 24B (Bedrock)", "kind": "bedrock",
      "price_in": 0.10, "price_out": 0.30},
     {"id": "mistral.voxtral-mini-3b-2507", "label": "Voxtral Mini 3B (Bedrock)", "kind": "bedrock",
@@ -373,9 +378,17 @@ def is_local_model(model: str) -> bool:
     return str(model).startswith("local:")
 
 
+def effective_stt_model(settings: Dict[str, Any], data_dir: Optional[Path]) -> str:
+    """The model a transcription really uses: a local model needs the engine; without it, Bedrock Voxtral."""
+    model = settings["stt_model"]
+    if is_local_model(model) and (data_dir is None or not engine_available(data_dir)):
+        return BEDROCK_STT_FALLBACK
+    return model
+
+
 def transcribe_wav(settings: Dict[str, Any], wav: bytes, prev_tail: str = "", data_dir: Optional[Path] = None,
                    model: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
-    model = model or settings["stt_model"]
+    model = effective_stt_model(settings, data_dir) if model is None else model
     if is_local_model(model):
         if data_dir is None:
             raise AppError("no_engine", "local models need the app's data directory", 500)
@@ -552,16 +565,16 @@ def label_speakers(data_dir: Path, settings: Dict[str, Any], meeting_id: str) ->
         with _temp_wav(data_dir, full) as path:
             raw = run_engine(data_dir, settings, {"op": "diarize", "wav": str(path)})["turns"]
             turns = merge_turns(raw)
-            model = settings["stt_model"]
+            model = effective_stt_model(settings, data_dir)
             if is_local_model(model):
-                # One local pass with word times, then each word goes to the turn it falls in.
-                out = run_engine(data_dir, settings, {"op": "transcribe", "wav": str(path),
-                                                      "model": model.split(":", 1)[1], "word_timestamps": True,
+                # Each speaker turn is transcribed on its own slice, in one engine process.
+                out = run_engine(data_dir, settings, {"op": "transcribe_turns", "wav": str(path),
+                                                      "model": model.split(":", 1)[1],
+                                                      "turns": [[t["start"], t["end"]] for t in turns],
                                                       "prompt": ", ".join(settings.get("vocabulary") or [])})
-                for t in turns:
-                    t["text"] = " ".join(w for s, e, w in out.get("words", [])
-                                         if t["start"] <= (s + e) / 2 < t["end"]).strip()
-        if not is_local_model(settings["stt_model"]):
+                for t, text in zip(turns, out.get("texts", [])):
+                    t["text"] = text
+        if not is_local_model(model):
             from concurrent.futures import ThreadPoolExecutor
 
             def one(t: Dict[str, Any]) -> str:
@@ -579,7 +592,7 @@ def label_speakers(data_dir: Path, settings: Dict[str, Any], meeting_id: str) ->
                                          "speaker": names[t["speaker"]], "text": t["text"]}, ensure_ascii=False))
         (d / "turns.jsonl").write_text("\n".join(lines) + ("\n" if lines else ""), "utf-8")
         return _update_meta(data_dir, meeting_id, speakers=len(names), speakers_status="ok",
-                            speakers_model=settings["stt_model"])
+                            speakers_model=model)
     except Exception as exc:  # keep the plain transcript; say why on the meeting
         msg = exc.message if isinstance(exc, AppError) else "%s: %s" % (type(exc).__name__, exc)
         return _update_meta(data_dir, meeting_id, speakers_status="failed: %s" % msg[:300])
@@ -744,7 +757,7 @@ def add_chunk(data_dir: Path, settings: Dict[str, Any], meeting_id: str, seq: in
     raw, usage = transcribe_wav(settings, wav, " ".join(prev_text.split()[-30:]), data_dir=data_dir)
     text = dedupe_overlap(prev_text, raw) if raw else ""
     row = {"seq": seq, "start_ms": start_ms, "end_ms": start_ms + duration_ms, "text": text, "raw": raw,
-           "model": settings["stt_model"], "latency_ms": int((time.time() - started) * 1000),
+           "model": effective_stt_model(settings, data_dir), "latency_ms": int((time.time() - started) * 1000),
            "input_tokens": usage.get("inputTokens"), "at": _now()}
     with _lock_for(meeting_id):
         with open(d / "transcript.jsonl", "a", encoding="utf-8") as fh:

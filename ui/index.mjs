@@ -318,8 +318,15 @@ function MeetingDetail({ api, id, onChanged, onDeleted }) {
     if (!window.confirm('Delete this meeting, its audio, transcript and summary? This cannot be undone.')) return
     try { await api.post(`${BASE}/meetings/${id}/delete`, {}); onDeleted() } catch (e) { setErr(errText(e)) }
   }
+  const turns = m.turns || []
+  const renameSpeaker = (sid, current) => {
+    const name = window.prompt(`Name for ${sid}`, current === sid ? '' : current)
+    if (name === null) return
+    act(() => api.put(`${BASE}/meetings/${id}`, { speaker_names: { [sid]: name.trim() } }))
+  }
   const download = () => {
-    const text = (m.transcript || []).map((s) => `[${fmtTs(s.start_ms)}] ${s.text}`).join('\n')
+    const text = (turns.length ? turns.map((t) => `[${fmtTs(t.start_ms)}] ${t.speaker}: ${t.text}`)
+      : (m.transcript || []).map((s) => `[${fmtTs(s.start_ms)}] ${s.text}`)).join('\n')
     const url = URL.createObjectURL(new Blob([`${meta.title}\n${fmtDate(meta.created_at)}\n\n${text}\n`], { type: 'text/plain' }))
     const a = document.createElement('a')
     a.href = url; a.download = `${meta.id}-transcript.txt`; a.click()
@@ -339,7 +346,12 @@ function MeetingDetail({ api, id, onChanged, onDeleted }) {
         h(Btn, { kind: 'danger', onClick: remove, disabled: meta.status === 'recording' }, 'Delete'))),
     h('div', { style: { ...S.muted, marginBottom: '10px' } }, `${fmtDate(meta.created_at)} \u00b7 ${fmtTs(meta.duration_ms)} recorded`),
     meta.error ? h('div', { style: { color: '#b45309', marginBottom: '10px' } }, meta.error) : null,
-    h('div', { style: { ...S.row, marginBottom: '10px' } }, tabBtn('summary', 'Summary'), tabBtn('transcript', `Transcript (${(m.transcript || []).length})`)),
+    meta.speakers_status && meta.speakers_status !== 'ok' && meta.speakers_status !== 'off'
+      ? h('div', { style: { ...S.muted, marginBottom: '10px' } }, `Speaker labels ${meta.speakers_status}`) : null,
+    h('div', { style: { ...S.row, marginBottom: '10px' } }, tabBtn('summary', 'Summary'),
+      turns.length ? tabBtn('speakers', `Speakers (${meta.speakers || speakerIds(turns).length})`) : null,
+      tabBtn('transcript', `Transcript (${(m.transcript || []).length})`)),
+    tab === 'speakers' ? h(SpeakerView, { turns, onRename: renameSpeaker }) :
     tab === 'summary' ? (meta.status === 'processing' ? h('div', { style: S.muted }, 'Writing the summary and indexing the transcript\u2026')
       : editing ? h(Fragment, null,
         h('textarea', { style: { ...S.input, minHeight: '320px', fontFamily: 'ui-monospace, monospace' }, value: draft, onChange: (e) => setDraft(e.target.value) }),
@@ -350,6 +362,34 @@ function MeetingDetail({ api, id, onChanged, onDeleted }) {
       : h('div', { style: S.scroll }, (m.transcript || []).length ? m.transcript.map((s) => h('div', { key: s.seq, style: { marginBottom: '6px' } }, h('span', { style: S.ts }, fmtTs(s.start_ms)), s.text))
         : h('div', { style: S.muted }, 'No speech was transcribed.')),
   )
+}
+
+// ---------------------------------------------------------------- speakers
+
+// Distinct hues that read on light and dark themes; text stays var(--text).
+const SPEAKER_HUES = [210, 25, 145, 280, 350, 55, 185, 320]
+const speakerIds = (turns) => [...new Set(turns.map((t) => t.speaker_id))]
+
+function SpeakerView({ turns, onRename }) {
+  const ids = speakerIds(turns)
+  const hue = (sid) => SPEAKER_HUES[ids.indexOf(sid) % SPEAKER_HUES.length]
+  const nameOf = {}
+  const talk = {}
+  for (const t of turns) {
+    nameOf[t.speaker_id] = t.speaker
+    talk[t.speaker_id] = (talk[t.speaker_id] || 0) + Math.max(0, (t.end_ms || 0) - (t.start_ms || 0))
+  }
+  const total = Object.values(talk).reduce((a, b) => a + b, 0) || 1
+  const chip = (sid) => h('button', {
+    key: sid, onClick: () => onRename(sid, nameOf[sid]), title: 'Click to rename',
+    style: { border: `1px solid hsl(${hue(sid)} 60% 50%)`, borderLeft: `6px solid hsl(${hue(sid)} 60% 50%)`, background: 'transparent', color: 'var(--text)', borderRadius: '6px', padding: '3px 10px', fontSize: '12px', cursor: 'pointer' },
+  }, `${nameOf[sid]} \u00b7 ${Math.round((100 * talk[sid]) / total)}%`)
+  return h(Fragment, null,
+    h('div', { style: { ...S.row, marginBottom: '8px' } }, ids.map(chip)),
+    h('div', { style: { ...S.muted, fontSize: '11px', marginBottom: '8px' } }, 'Speakers are found from their voices. Click a name to rename it everywhere. Words near a change of speaker can land with the wrong person.'),
+    h('div', { style: S.scroll }, turns.map((t, i) => h('div', { key: i, style: { marginBottom: '8px', paddingLeft: '8px', borderLeft: `3px solid hsl(${hue(t.speaker_id)} 60% 50%)` } },
+      h('div', { style: { fontSize: '12px', fontWeight: 600 } }, h('span', { style: S.ts }, fmtTs(t.start_ms)), t.speaker),
+      h('div', null, t.text)))))
 }
 
 // ---------------------------------------------------------------- search and ask
@@ -392,7 +432,7 @@ function SearchPanel({ api, onOpen }) {
 const FIELDS = [
   ['aws_profile', 'AWS profile', 'A named profile from ~/.aws/config on the machine running Kiro Crew'],
   ['aws_region', 'Bedrock region', 'e.g. us-west-2'],
-  ['stt_model', 'Speech-to-text model', 'Bedrock model id that accepts audio (Voxtral)'],
+  ['stt_model', 'Speech-to-text model', 'Pick from the list; scores come from eval/stt/compare.py'],
   ['llm_model', 'Summary / answer model', 'Model id or inference profile, e.g. us.anthropic.claude-sonnet-4-6'],
   ['embed_model', 'Embedding model', 'amazon.titan-embed-text-v2:0 or cohere.embed-v4:0 (us.cohere.embed-v4:0)'],
   ['chunk_seconds', 'Chunk length (s)', 'Audio per transcription call, 5 to 60'],
@@ -405,13 +445,31 @@ function SettingsPanel({ api, settings, onSaved, firstRun }) {
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState('')
   const [test, setTest] = useState(null)
+  const [stt, setStt] = useState(null)
+  useEffect(() => { api.get(BASE + '/stt-models').then(setStt).catch(() => setStt(null)) }, [api])
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
+  const modelLabel = (md) => {
+    const bits = [md.label]
+    if (md.wer != null) bits.push(`${(100 * md.wer).toFixed(1)}% words wrong`)
+    bits.push(md.kind === 'local' ? '$0' : (md.usd_per_hour != null ? `$${md.usd_per_hour.toFixed(3)}/hour` : 'Bedrock, billed'))
+    if (md.seconds_per_audio_minute != null) bits.push(`${md.seconds_per_audio_minute}s per audio min`)
+    if (stt && stt.recommended === md.id) bits.push('best')
+    if (!md.available) bits.push('needs scripts/setup_engine.py')
+    return bits.join(' \u00b7 ')
+  }
+  const field = (k, help) => k === 'stt_model' && stt && stt.models
+    ? h('select', { style: S.input, value: form[k] ?? '', onChange: set(k) },
+      (stt.models.some((md) => md.id === form[k]) ? [] : [h('option', { key: form[k], value: form[k] }, form[k])])
+        .concat(stt.models.map((md) => h('option', { key: md.id, value: md.id }, modelLabel(md)))))
+    : h('input', { style: S.input, value: form[k] ?? '', onChange: set(k), placeholder: help })
   const save = async (andTest) => {
     setBusy(andTest ? 'test' : 'save'); setErr(''); setTest(null)
     try {
       const patch = {}
       for (const [k] of FIELDS) patch[k] = form[k]
       patch.vocabulary = form.vocabulary
+      if (!firstRun) patch.speaker_labels = form.speaker_labels !== false
+      if (patch.stt_model === settings.stt_model) delete patch.stt_model // unchanged: keep auto-selection on
       const saved = await api.put(BASE + '/settings', patch)
       if (andTest) setTest(await api.post(BASE + '/settings/test', {}))
       onSaved(saved)
@@ -425,8 +483,11 @@ function SettingsPanel({ api, settings, onSaved, firstRun }) {
     h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '10px' } },
       shown.map(([k, label, help]) => h('label', { key: k, style: { display: 'block' } },
         h('div', { style: { fontSize: '12px', fontWeight: 600, marginBottom: '3px' } }, label),
-        h('input', { style: S.input, value: form[k] ?? '', onChange: set(k), placeholder: help }),
+        field(k, help),
         h('div', { style: { ...S.muted, fontSize: '11px' } }, help)))),
+    !firstRun ? h('label', { style: { ...S.row, ...S.muted, gap: '6px', marginTop: '10px' } },
+      h('input', { type: 'checkbox', checked: form.speaker_labels !== false, onChange: (e) => setForm((f) => ({ ...f, speaker_labels: e.target.checked })) }),
+      'Label who spoke when, on Stop (runs on this machine)') : null,
     !firstRun ? h('label', { style: { display: 'block', marginTop: '10px' } },
       h('div', { style: { fontSize: '12px', fontWeight: 600, marginBottom: '3px' } }, 'Vocabulary'),
       h('textarea', { style: { ...S.input, minHeight: '80px' }, value: form.vocabulary, onChange: set('vocabulary'), placeholder: 'One per line: names, acronyms and product terms to spell correctly' })) : null,
