@@ -1,0 +1,7 @@
+data/
+__pycache__/
+*.pyc
+.app_secret
+app-crons.json
+installed.json
+.DS_Store

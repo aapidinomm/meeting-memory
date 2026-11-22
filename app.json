@@ -1,0 +1,51 @@
+{
+  "name": "meeting-memory",
+  "version": "0.1.0",
+  "displayName": "Meeting Memory",
+  "description": "Record a meeting from your browser microphone, transcribe it with Amazon Bedrock in your own AWS account, and keep searchable summaries, decisions and action items on your machine.",
+  "author": "monidipa",
+  "tags": ["meetings", "transcription", "bedrock", "notes", "search"],
+  "highlights": [
+    "Start, pause and stop from the app page: the browser records your mic, and optionally a shared tab's audio for remote voices",
+    "Live transcript through Bedrock speech-to-text (Mistral Voxtral by default), chunked with overlap so no word is cut",
+    "A vocabulary list steers the spelling of names, acronyms and product terms",
+    "On stop, a Bedrock LLM writes the summary, decisions, action items with owners, and open questions",
+    "Search and ask across every meeting (keyword plus Bedrock embeddings), with citations to the meeting and timestamp",
+    "MCP tools so your agent can search and read your meetings from chat",
+    "Everything is stored locally; the AWS profile is a setting, never hardcoded"
+  ],
+  "useCases": [
+    "Keep a searchable record of standups, design reviews and 1:1s",
+    "Ask what was decided about a topic across last month's meetings"
+  ],
+  "configuration": [
+    "Choose the AWS profile and region that have Bedrock access: on the app page's first screen, or run python3 scripts/configure.py --aws-profile <name> from the installed app directory. Change it later in the app's Settings.",
+    "The profile must work for the Kiro Crew gateway process (for example `aws sts get-caller-identity --profile <name>` succeeds in the shell that started the gateway).",
+    "Open the dashboard over https or http://localhost (an SSH port-forward for a remote host) so the browser allows microphone access."
+  ],
+  "platform": { "os": ["linux", "macos"] },
+  "skills": ["skills/meeting-memory"],
+  "backend": {
+    "hooks": { "routes": "backend.routes:register_routes" }
+  },
+  "ui": {
+    "entry": "index.mjs",
+    "pages": [
+      { "route": "/apps/meeting-memory", "label": "Meeting Memory", "iconUrl": "icon.svg" }
+    ],
+    "loading": { "layout": "page" }
+  },
+  "permissions": {
+    "api": ["/api/apps/meeting-memory/*"],
+    "network": true
+  },
+  "setup": {
+    "onUninstall": "bash scripts/uninstall.sh"
+  },
+  "mcpServers": {
+    "meeting-memory": {
+      "command": "python3",
+      "args": ["mcp/server.py"]
+    }
+  }
+}
