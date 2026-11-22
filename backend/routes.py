@@ -116,6 +116,11 @@ async def put_settings(request, ctx):
     return _json(await _run(core.save_settings, ctx.data_dir, await _body(request)))
 
 
+@_guard("settings_read")
+async def get_stt_models(request, ctx):
+    return _json(await _run(core.stt_options, ctx.data_dir))
+
+
 @_guard("settings_test")
 async def post_settings_test(request, ctx):
     return _json(await _run(core.check_connection, _cfg(ctx)))
@@ -187,6 +192,7 @@ def register_routes(ctx):
         Route("GET", "/settings", get_settings),
         Route("PUT", "/settings", put_settings),
         Route("POST", "/settings/test", post_settings_test),
+        Route("GET", "/stt-models", get_stt_models),
         Route("GET", "/meetings", get_meetings),
         Route("POST", "/meetings", post_meeting),
         Route("GET", "/meetings/{meeting_id}", get_meeting),

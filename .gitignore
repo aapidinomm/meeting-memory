@@ -5,3 +5,6 @@ __pycache__/
 app-crons.json
 installed.json
 .DS_Store
+eval/diarization/data/
+eval/stt/data/
+eval/stt/train/

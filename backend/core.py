@@ -46,11 +46,32 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "overlap_seconds": 1.5,
     "vocabulary": [],
     "language_hint": "",
+    # Label who spoke when, on Stop, with the local engine (scripts/setup_engine.py). Skipped, never fatal,
+    # when the engine is not installed.
+    "speaker_labels": True,
+    # False until the user picks a speech-to-text model; while False, a model comparison
+    # (eval/stt/compare.py) may switch stt_model to its recommendation.
+    "stt_model_from_user": False,
 }
+
+# Speech-to-text models the app can use. Bedrock prices are USD per 1M tokens, on-demand, US East/West
+# (https://aws.amazon.com/bedrock/pricing/, read 2026-11-22). Local models run on this machine through the
+# engine (faster-whisper, int8 on CPU) and cost no money; the first use downloads them.
+STT_MODELS: List[Dict[str, Any]] = [
+    {"id": "mistral.voxtral-small-24b-2507", "label": "Voxtral Small 24B (Bedrock)", "kind": "bedrock",
+     "price_in": 0.10, "price_out": 0.30},
+    {"id": "mistral.voxtral-mini-3b-2507", "label": "Voxtral Mini 3B (Bedrock)", "kind": "bedrock",
+     "price_in": 0.04, "price_out": 0.04},
+    {"id": "local:tiny.en", "label": "Whisper tiny.en (local)", "kind": "local", "size_mb": 75},
+    {"id": "local:base.en", "label": "Whisper base.en (local)", "kind": "local", "size_mb": 145},
+    {"id": "local:small.en", "label": "Whisper small.en (local)", "kind": "local", "size_mb": 485},
+    {"id": "local:large-v3-turbo", "label": "Whisper large-v3 turbo (local)", "kind": "local", "size_mb": 1600},
+]
 
 # Bounds on values a settings write may set: the UI and MCP tool pass user input straight through.
 _INT_BOUNDS = {"embed_dims": (256, 1024), "chunk_seconds": (5, 60)}
 _FLOAT_BOUNDS = {"overlap_seconds": (0.0, 5.0)}
+_BOOL_KEYS = ("speaker_labels", "stt_model_from_user")
 _STR_KEYS = ("aws_profile", "aws_region", "stt_model", "llm_model", "embed_model", "language_hint")
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+=@,:/-]{0,128}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
@@ -147,6 +168,9 @@ def validate_settings_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
                 raise AppError("bad_param", "%s must be a number" % key)
             if not lo <= value <= hi:
                 raise AppError("bad_param", "%s must be between %s and %s" % (key, lo, hi))
+        elif key in _BOOL_KEYS:
+            if not isinstance(value, bool):
+                raise AppError("bad_param", "%s must be true or false" % key)
         elif key == "vocabulary":
             value = _clean_vocab(value)
         clean[key] = value
@@ -156,6 +180,8 @@ def validate_settings_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
 def save_settings(data_dir: Path, patch: Dict[str, Any]) -> Dict[str, Any]:
     clean = validate_settings_patch(patch)
     current = load_settings(data_dir)
+    if "stt_model" in clean and "stt_model_from_user" not in clean and clean["stt_model"] != current["stt_model"]:
+        clean["stt_model_from_user"] = True  # a person chose it: comparisons no longer override it
     if "embed_model" in clean or "embed_dims" in clean:
         if (clean.get("embed_model", current["embed_model"]) != current["embed_model"]
                 or clean.get("embed_dims", current["embed_dims"]) != current["embed_dims"]):
@@ -259,7 +285,10 @@ def check_connection(settings: Dict[str, Any]) -> Dict[str, Any]:
             checks[kind] = "ok"
         except AppError as exc:
             checks[kind] = exc.message
-    checks["stt"] = "ok" if _silent_stt_probe(settings) else "failed"
+    if is_local_model(settings["stt_model"]):
+        checks["stt"] = "ok"  # local model: no Bedrock call to check
+    else:
+        checks["stt"] = "ok" if _silent_stt_probe(settings) else "failed"
     out["checks"] = checks
     out["ok"] = all(v == "ok" for v in checks.values())
     return out
@@ -340,14 +369,282 @@ def _stt_prompt(settings: Dict[str, Any], prev_tail: str) -> str:
     return "\n".join(lines)
 
 
-def transcribe_wav(settings: Dict[str, Any], wav: bytes, prev_tail: str = "") -> Tuple[str, Dict[str, Any]]:
-    text, usage = _converse_text(settings, settings["stt_model"], [
-        {"audio": {"format": "wav", "source": {"bytes": wav}}},
-        {"text": _stt_prompt(settings, prev_tail)}], max_tokens=2048)
+def is_local_model(model: str) -> bool:
+    return str(model).startswith("local:")
+
+
+def transcribe_wav(settings: Dict[str, Any], wav: bytes, prev_tail: str = "", data_dir: Optional[Path] = None,
+                   model: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    model = model or settings["stt_model"]
+    if is_local_model(model):
+        if data_dir is None:
+            raise AppError("no_engine", "local models need the app's data directory", 500)
+        vocab = settings.get("vocabulary") or []
+        prompt = (prev_tail + " " if prev_tail else "") + (", ".join(vocab) if vocab else "")
+        with _temp_wav(data_dir, wav) as path:
+            out = run_engine(data_dir, settings, {"op": "transcribe", "wav": str(path),
+                                                  "model": model.split(":", 1)[1], "prompt": prompt.strip()})
+        text, usage = out.get("text", ""), {"engine_seconds": out.get("seconds")}
+    else:
+        text, usage = _converse_text(settings, model, [
+            {"audio": {"format": "wav", "source": {"bytes": wav}}},
+            {"text": _stt_prompt(settings, prev_tail)}], max_tokens=2048)
     text = text.strip().strip('"').strip()
     if _NO_SPEECH.match(text):
         text = ""
     return text, usage
+
+
+# ---------------------------------------------------------------- local engine (speakers, local models)
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+ENGINE_TIMEOUT_SECS = 1800
+
+
+def engine_python(data_dir: Path) -> Path:
+    return Path(data_dir) / "engine" / "bin" / "python"
+
+
+def engine_available(data_dir: Path) -> bool:
+    return engine_python(data_dir).is_file() and (APP_ROOT / "engine" / "worker.py").is_file()
+
+
+class _temp_wav:
+    """A WAV written under the data dir for the engine to read, removed afterwards."""
+
+    def __init__(self, data_dir: Path, wav: bytes):
+        self.path = Path(data_dir) / "tmp" / ("%s.wav" % uuid.uuid4().hex)
+        self.wav = wav
+
+    def __enter__(self) -> Path:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(self.wav)
+        return self.path
+
+    def __exit__(self, *exc: Any) -> None:
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def run_engine(data_dir: Path, settings: Dict[str, Any], request: Dict[str, Any],
+               timeout: int = ENGINE_TIMEOUT_SECS) -> Dict[str, Any]:
+    import subprocess  # local import: only the engine path spawns processes
+
+    if not engine_available(data_dir):
+        raise AppError("no_engine", "The local engine is not installed. Run scripts/setup_engine.py.", 409)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AWS_")}  # the engine never needs AWS
+    try:
+        proc = subprocess.run([str(engine_python(data_dir)), str(APP_ROOT / "engine" / "worker.py")],
+                              input=json.dumps(request), capture_output=True, text=True, timeout=timeout,
+                              cwd=str(data_dir), env=env)
+    except subprocess.TimeoutExpired:
+        raise AppError("engine_timeout", "the local engine took longer than %d s" % timeout, 504)
+    try:
+        out = json.loads(proc.stdout or "{}")
+    except ValueError:
+        out = {"ok": False, "error": (proc.stderr or "no output").strip()[-500:]}
+    if not out.get("ok"):
+        raise AppError("engine_error", "local engine: %s" % out.get("error", "failed"), 500)
+    return out
+
+
+def _wav_samples(data: bytes) -> array.array:
+    """16-bit mono PCM samples of a WAV the browser (or wav_bytes) wrote."""
+    pos, fmt_ok = 12, False
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fmt ":
+            channels, rate, bits = struct.unpack("<H", body[2:4])[0], struct.unpack("<I", body[4:8])[0], \
+                struct.unpack("<H", body[14:16])[0]
+            fmt_ok = channels == 1 and rate == 16000 and bits == 16
+        elif cid == b"data":
+            if not fmt_ok:
+                break
+            pcm = array.array("h")
+            pcm.frombytes(body[:len(body) // 2 * 2])
+            if sys.byteorder != "little":
+                pcm.byteswap()
+            return pcm
+        pos += 8 + size + (size & 1)
+    raise AppError("bad_audio", "audio chunk is not 16 kHz mono 16-bit PCM")
+
+
+def assemble_audio(data_dir: Path, meeting_id: str) -> array.array:
+    """The whole meeting as one 16 kHz sample array: each chunk placed at its start time, so the
+    overlap between chunks is written once rather than twice."""
+    d = meeting_dir(data_dir, meeting_id)
+    starts = {int(r.get("seq", -1)): int(r.get("start_ms") or 0) for r in read_transcript(data_dir, meeting_id)}
+    out = array.array("h")
+    for f in sorted((d / "audio").glob("*.wav")):
+        try:
+            seq = int(f.stem)
+            pcm = _wav_samples(f.read_bytes())
+        except (ValueError, AppError, OSError):
+            continue
+        at = starts.get(seq, 0) * 16
+        if len(out) < at + len(pcm):
+            out.extend([0] * (at + len(pcm) - len(out)))
+        out[at:at + len(pcm)] = pcm
+    return out
+
+
+def merge_turns(turns: List[List[Any]], gap_s: float = 0.8, min_s: float = 1.0) -> List[Dict[str, Any]]:
+    """Join a speaker's back-to-back turns, and fold turns too short to transcribe into a neighbour."""
+    merged: List[Dict[str, Any]] = []
+    for s, e, spk in sorted(turns, key=lambda t: t[0]):
+        if merged and merged[-1]["speaker"] == spk and s - merged[-1]["end"] <= gap_s:
+            merged[-1]["end"] = max(merged[-1]["end"], e)
+        else:
+            merged.append({"start": float(s), "end": float(e), "speaker": str(spk)})
+    out: List[Dict[str, Any]] = []
+    for t in merged:
+        if t["end"] - t["start"] < min_s and out:
+            out[-1]["end"] = max(out[-1]["end"], t["end"])
+        else:
+            out.append(t)
+    return out
+
+
+def _speaker_names(turns: List[Dict[str, Any]]) -> Dict[str, str]:
+    names: Dict[str, str] = {}
+    for t in turns:
+        names.setdefault(t["speaker"], "Speaker %d" % (len(names) + 1))
+    return names
+
+
+def read_turns(data_dir: Path, meeting_id: str) -> List[Dict[str, Any]]:
+    path = meeting_dir(data_dir, meeting_id) / "turns.jsonl"
+    rows = []
+    try:
+        for line in path.read_text("utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    except OSError:
+        pass
+    return rows
+
+
+def _speaker_label(meta: Dict[str, Any], spk: str) -> str:
+    names = meta.get("speaker_names") or {}
+    return str(names.get(spk) or spk)
+
+
+def label_speakers(data_dir: Path, settings: Dict[str, Any], meeting_id: str) -> Dict[str, Any]:
+    """Find who spoke when, then transcribe each speaker turn. Writes turns.jsonl and records the outcome in
+    meta.json. Never raises: the meeting keeps its plain transcript when this cannot run."""
+    if not settings.get("speaker_labels"):
+        return _update_meta(data_dir, meeting_id, speakers_status="off")
+    if not engine_available(data_dir):
+        return _update_meta(data_dir, meeting_id, speakers_status="skipped: the local engine is not installed")
+    d = meeting_dir(data_dir, meeting_id)
+    try:
+        pcm = assemble_audio(data_dir, meeting_id)
+        if len(pcm) < 16000 * 3:
+            return _update_meta(data_dir, meeting_id, speakers_status="skipped: under 3 seconds of audio")
+        full = wav_bytes(pcm)
+        with _temp_wav(data_dir, full) as path:
+            raw = run_engine(data_dir, settings, {"op": "diarize", "wav": str(path)})["turns"]
+            turns = merge_turns(raw)
+            model = settings["stt_model"]
+            if is_local_model(model):
+                # One local pass with word times, then each word goes to the turn it falls in.
+                out = run_engine(data_dir, settings, {"op": "transcribe", "wav": str(path),
+                                                      "model": model.split(":", 1)[1], "word_timestamps": True,
+                                                      "prompt": ", ".join(settings.get("vocabulary") or [])})
+                for t in turns:
+                    t["text"] = " ".join(w for s, e, w in out.get("words", [])
+                                         if t["start"] <= (s + e) / 2 < t["end"]).strip()
+        if not is_local_model(settings["stt_model"]):
+            from concurrent.futures import ThreadPoolExecutor
+
+            def one(t: Dict[str, Any]) -> str:
+                a, b = int(t["start"] * 16000), int(t["end"] * 16000)
+                return transcribe_wav(settings, wav_bytes(pcm[a:b]), data_dir=data_dir)[0]
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for t, text in zip(turns, pool.map(one, turns)):
+                    t["text"] = text
+        names = _speaker_names(turns)
+        lines = []
+        for t in turns:
+            if t.get("text"):
+                lines.append(json.dumps({"start_ms": int(t["start"] * 1000), "end_ms": int(t["end"] * 1000),
+                                         "speaker": names[t["speaker"]], "text": t["text"]}, ensure_ascii=False))
+        (d / "turns.jsonl").write_text("\n".join(lines) + ("\n" if lines else ""), "utf-8")
+        return _update_meta(data_dir, meeting_id, speakers=len(names), speakers_status="ok",
+                            speakers_model=settings["stt_model"])
+    except Exception as exc:  # keep the plain transcript; say why on the meeting
+        msg = exc.message if isinstance(exc, AppError) else "%s: %s" % (type(exc).__name__, exc)
+        return _update_meta(data_dir, meeting_id, speakers_status="failed: %s" % msg[:300])
+
+
+def speaker_rows(data_dir: Path, meeting_id: str) -> List[Dict[str, Any]]:
+    """Transcript rows with the speaker in front of the text, or [] when the meeting has no speaker turns."""
+    meta = read_meta(data_dir, meeting_id)
+    return [{"start_ms": t.get("start_ms"), "end_ms": t.get("end_ms"), "speaker": _speaker_label(meta, t["speaker"]),
+             "text": "%s: %s" % (_speaker_label(meta, t["speaker"]), t.get("text", ""))}
+            for t in read_turns(data_dir, meeting_id) if t.get("text") and t.get("speaker")]
+
+
+# ---------------------------------------------------------------- speech-to-text model comparison
+
+
+def stt_eval_path(data_dir: Path) -> Path:
+    return Path(data_dir) / "stt_eval.json"
+
+
+def recommend_stt(results: List[Dict[str, Any]], wer_slack: float = 0.01) -> Optional[str]:
+    """The model to use by default: the cheapest one whose word error rate is within wer_slack (one
+    percentage point) of the best; ties go to the faster one. Local models cost $0."""
+    ok = [r for r in results if r.get("ok") and r.get("wer") is not None]
+    if not ok:
+        return None
+    best = min(r["wer"] for r in ok)
+    near = [r for r in ok if r["wer"] <= best + wer_slack]
+    near.sort(key=lambda r: (r.get("usd_per_hour") or 0.0, r.get("seconds_per_audio_minute") or 0.0, r["wer"]))
+    return near[0]["model"]
+
+
+def stt_options(data_dir: Path) -> Dict[str, Any]:
+    ev = _read_json(stt_eval_path(data_dir), {})
+    results = {r.get("model"): r for r in (ev.get("results") or [])} if isinstance(ev, dict) else {}
+    local_ok = engine_available(data_dir)
+    models = []
+    for m in STT_MODELS:
+        row = dict(m)
+        row["available"] = local_ok if m["kind"] == "local" else True
+        r = results.get(m["id"])
+        if r:
+            row.update({k: r.get(k) for k in ("wer", "usd_per_hour", "seconds_per_audio_minute", "ok", "error")})
+        models.append(row)
+    return {"models": models, "recommended": ev.get("recommended") if isinstance(ev, dict) else None,
+            "evaluated_at": ev.get("evaluated_at") if isinstance(ev, dict) else None,
+            "test_set": ev.get("test_set") if isinstance(ev, dict) else None, "engine": local_ok}
+
+
+def save_stt_eval(data_dir: Path, report: Dict[str, Any], apply: bool = True) -> Dict[str, Any]:
+    """Store a comparison report; switch stt_model to its recommendation unless the user chose a model."""
+    report = dict(report)
+    old = _read_json(stt_eval_path(data_dir), {})
+    if isinstance(old, dict) and old.get("test_set") == report.get("test_set"):
+        # Same test set: keep earlier results for models this run did not measure (e.g. a local-only rerun).
+        fresh = {r.get("model") for r in report.get("results") or []}
+        report["results"] = [r for r in old.get("results") or [] if r.get("model") not in fresh] + \
+            list(report.get("results") or [])
+    report["recommended"] = recommend_stt(report.get("results") or [])
+    _write_json(stt_eval_path(data_dir), report)
+    settings = load_settings(data_dir)
+    if apply and report["recommended"] and not settings.get("stt_model_from_user"):
+        settings["stt_model"] = report["recommended"]
+        _write_json(Path(data_dir) / "settings.json", settings)
+    return report
 
 
 # ---------------------------------------------------------------- meetings storage
@@ -444,7 +741,7 @@ def add_chunk(data_dir: Path, settings: Dict[str, Any], meeting_id: str, seq: in
         prev = max((r for r in rows if r.get("seq", -1) < seq), key=lambda r: r["seq"], default=None)
         prev_text = (prev or {}).get("text", "")
     started = time.time()
-    raw, usage = transcribe_wav(settings, wav, " ".join(prev_text.split()[-30:]))
+    raw, usage = transcribe_wav(settings, wav, " ".join(prev_text.split()[-30:]), data_dir=data_dir)
     text = dedupe_overlap(prev_text, raw) if raw else ""
     row = {"seq": seq, "start_ms": start_ms, "end_ms": start_ms + duration_ms, "text": text, "raw": raw,
            "model": settings["stt_model"], "latency_ms": int((time.time() - started) * 1000),
@@ -488,6 +785,10 @@ def get_meeting(data_dir: Path, meeting_id: str, include_transcript: bool = True
     if include_transcript:
         out["transcript"] = [{k: r.get(k) for k in ("seq", "start_ms", "end_ms", "text")}
                              for r in read_transcript(data_dir, meeting_id) if r.get("text")]
+        meta = out["meta"]
+        out["turns"] = [{"start_ms": t.get("start_ms"), "end_ms": t.get("end_ms"), "speaker_id": t.get("speaker"),
+                         "speaker": _speaker_label(meta, t.get("speaker", "")), "text": t.get("text")}
+                        for t in read_turns(data_dir, meeting_id) if t.get("text")]
     return out
 
 
@@ -505,6 +806,18 @@ def update_meeting(data_dir: Path, meeting_id: str, patch: Dict[str, Any]) -> Di
             raise AppError("bad_param", "summary is too long")
         (d / "summary.md").write_text(md, "utf-8")
         changes["summary_edited"] = True
+    if "speaker_names" in patch:
+        names = patch["speaker_names"]
+        known = {t.get("speaker") for t in read_turns(data_dir, meeting_id)}
+        if not isinstance(names, dict) or not all(k in known for k in names):
+            raise AppError("bad_param", "speaker_names maps a speaker (e.g. \"Speaker 1\") to a name")
+        clean = {str(k): str(v or "").strip()[:80] for k, v in names.items()}
+        current = dict(read_meta(data_dir, meeting_id).get("speaker_names") or {})
+        current.update({k: v for k, v in clean.items() if v})
+        for k, v in clean.items():
+            if not v:
+                current.pop(k, None)
+        changes["speaker_names"] = current
     if changes:
         _update_meta(data_dir, meeting_id, **changes)
     if "summary_md" in patch or "title" in patch:
@@ -605,7 +918,7 @@ def render_summary_md(title: str, s: Dict[str, Any]) -> str:
 def summarize(data_dir: Path, settings: Dict[str, Any], meeting_id: str) -> Dict[str, Any]:
     d = meeting_dir(data_dir, meeting_id)
     meta = read_meta(data_dir, meeting_id)
-    rows = read_transcript(data_dir, meeting_id)
+    rows = speaker_rows(data_dir, meeting_id) or read_transcript(data_dir, meeting_id)
     text = transcript_text(rows)
     if not text.strip():
         summary = normalize_summary({"tldr": "No speech was transcribed in this meeting."})
@@ -631,6 +944,7 @@ def summarize(data_dir: Path, settings: Dict[str, Any], meeting_id: str) -> Dict
 def finalize(data_dir: Path, settings: Dict[str, Any], meeting_id: str) -> Dict[str, Any]:
     """Summarize and index a stopped meeting. Records the outcome in meta.json; never raises."""
     try:
+        label_speakers(data_dir, settings, meeting_id)
         summarize(data_dir, settings, meeting_id)
         index_meeting(data_dir, settings, meeting_id)
         return _update_meta(data_dir, meeting_id, status="done", error="", processing_since=None)
@@ -753,7 +1067,7 @@ def transcript_windows(rows: List[Dict[str, Any]], max_chars: int = EMBED_WINDOW
 
 
 def index_meeting(data_dir: Path, settings: Dict[str, Any], meeting_id: str) -> int:
-    rows = read_transcript(data_dir, meeting_id)
+    rows = speaker_rows(data_dir, meeting_id) or read_transcript(data_dir, meeting_id)
     docs = [dict(w, kind="transcript") for w in transcript_windows(rows)]
     summary_md = ""
     try:
